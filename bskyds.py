@@ -1,8 +1,8 @@
 from atproto import Client
-from dotenv import load_dotenv #pip install python-dotenv
-from textblob import TextBlob #pip install and python -m textblob.download_corpora
+from dotenv import load_dotenv
+from textblob import TextBlob
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import time
 
@@ -13,26 +13,39 @@ password = os.getenv("PASSWORD")
 client = Client()
 client.login(username, password)
 
-def get_trump_posts_election_day(limit=100, pages=5):
+# Parameters
+KEYWORD = "Trump"
+START_DATE = datetime(2024, 11, 3, tzinfo=timezone.utc) #10/28/2024
+END_DATE = datetime(2024, 11, 4, tzinfo=timezone.utc) #11/04/2024
+OUTPUT_FILE = "trump_posts_incremental.json"
+SLEEP_BETWEEN_REQUESTS = 1  # seconds
+BATCH_SIZE = 50  # posts per API call
 
-    #get posts about Trump on election day, and classify by sentiment
- 
-    keyword = "Trump since:2024-11-05 until:2024-11-06" # can change day and we might have to set up timezone
-    #exclude_terms = ["Ivanka", "Melania", "Barron", "Donald Trump Jr."] might have to clean up after because this might take out trump too
+# Try to load existing results if interrupted before
+try:
+    with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        sentiment_data = json.load(f)
+except FileNotFoundError:
+    sentiment_data = {"positive": [], "neutral": [], "negative": []}
+
+def save_incremental():
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(sentiment_data, f, ensure_ascii=False, indent=4)
+
+def fetch_posts(keyword, start_date, end_date):
     cursor = None
+    total_collected = sum(len(v) for v in sentiment_data.values())
 
-    sentiment_data = {
-        "positive": [],
-        "neutral": [],
-        "negative": []
-    }
+    while True:
+        # Include the date range in the query for better results
+        query = f"{keyword} since:{start_date.date()} until:{end_date.date()}"
 
-    for _ in range(pages):
         response = client.app.bsky.feed.search_posts(
-            params={"q": keyword, "sort": "latest", "cursor": cursor}
+            params={"q": query, "sort": "latest", "cursor": cursor, "limit": BATCH_SIZE}
         )
 
         if not response.posts:
+            print("No more posts returned by API.")
             break
 
         for post in response.posts:
@@ -40,8 +53,10 @@ def get_trump_posts_election_day(limit=100, pages=5):
             if not text:
                 continue
 
-            # if any(term.lower() in text.lower() for term in exclude_terms):
-            #     continue
+            # Convert timestamp to datetime
+            ts = datetime.fromisoformat(post.indexed_at.replace("Z", "+00:00"))
+            if not (start_date <= ts <= end_date):
+                continue
 
             sentiment = TextBlob(text).sentiment.polarity
 
@@ -56,7 +71,6 @@ def get_trump_posts_election_day(limit=100, pages=5):
                 "timestamp": post.indexed_at,
             }
 
-            # Classify by sentiment
             if sentiment > 0.2:
                 sentiment_data["positive"].append(post_info)
             elif sentiment < -0.2:
@@ -64,34 +78,22 @@ def get_trump_posts_election_day(limit=100, pages=5):
             else:
                 sentiment_data["neutral"].append(post_info)
 
+            total_collected += 1
+
+            if total_collected % 10 == 0:
+                print(f"Collected {total_collected} posts so far...")
+                save_incremental()  # save every 10 posts
+
         cursor = getattr(response, "cursor", None)
         if not cursor:
+            print("Reached end of available posts.")
             break
 
-        time.sleep(1)  # avoid rate limits
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-    # Trim to limit per sentiment
-    for key in sentiment_data:
-        sentiment_data[key] = sentiment_data[key][:limit]
+    save_incremental()
+    print(f"Finished collecting posts. Total: {total_collected}")
 
-    return sentiment_data
-
-
-def save_to_json(data, filename):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
-print("Searching posts about Trump on 2024 election day...")
-
-sentiment_results = get_trump_posts_election_day(limit=100, pages=5)
-
-output_file = "trump_posts_2024_election_day.json"
-save_to_json(sentiment_results, output_file)
-
-pos = len(sentiment_results["positive"])
-neg = len(sentiment_results["negative"])
-neu = len(sentiment_results["neutral"])
-
-print(f"✅ Saved results to {output_file}")
-print(f"📊 Positive: {pos}, Neutral: {neu}, Negative: {neg}")
+if __name__ == "__main__":
+    print(f"Starting collection for keyword '{KEYWORD}' from {START_DATE.date()} to {END_DATE.date()}")
+    fetch_posts(KEYWORD, START_DATE, END_DATE)
